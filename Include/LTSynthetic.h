@@ -332,6 +332,11 @@ protected:
     
     /// Navigation data cache for SID/STAR procedures  
     std::map<std::string, std::vector<positionTy>> sidStarCache;
+    mutable std::mutex sidStarCacheMutex;           ///< Mutex to protect SID/STAR cache access
+    
+    /// Cache management for SID/STAR procedures
+    void CleanupSIDSTARCache();                     ///< Clean up old cache entries
+    static const size_t MAX_SIDSTAR_CACHE_SIZE = 200; ///< Maximum cache entries
     
     /// CSL Model database for enhanced aircraft selection
     struct CSLModelData {

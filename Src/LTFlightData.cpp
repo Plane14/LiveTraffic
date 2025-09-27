@@ -2211,9 +2211,23 @@ void LTFlightData::AddDynData (const FDDynamicData& inDyn,
                 }
                 // has already an aircraft
                 else {
-                    // Synthetic channels are to be kicked out as soon as any other channel has data,
-                    // ie. only for other types we still consider skipping the data:
-                    if (pLstChn && pLstChn->GetChType() != LTChannel::CHT_SYNTHETIC_DATA)
+                    // Enhanced channel switching logic to better support synthetic traffic:
+                    // Only switch away from synthetic channels if there's real tracking data for the same aircraft
+                    if (pLstChn && pLstChn->GetChType() == LTChannel::CHT_SYNTHETIC_DATA && 
+                        inDyn.pChannel->GetChType() != LTChannel::CHT_SYNTHETIC_DATA)
+                    {
+                        // Switching FROM synthetic TO real data - allow with some grace period
+                        if (!posDeque.empty())
+                            return;
+                        
+                        // Allow more time for synthetic data to be replaced - only switch if real data is significantly newer
+                        const double tsCutOff = GetYoungestTS() + dataRefs.GetFdRefreshIntvl() * 2.0; // Increased from 1.5 to 2.0
+                        if (inDyn.ts < tsCutOff)
+                            return;
+                    }
+                    // For non-synthetic channels, use the original logic but be less aggressive
+                    else if (pLstChn && pLstChn->GetChType() != LTChannel::CHT_SYNTHETIC_DATA && 
+                             inDyn.pChannel->GetChType() != LTChannel::CHT_SYNTHETIC_DATA)
                     {
                         // If there still are position to be processed we don't switch channel
                         if (!posDeque.empty())
@@ -2225,6 +2239,7 @@ void LTFlightData::AddDynData (const FDDynamicData& inDyn,
                         if (inDyn.ts < tsCutOff)
                             return;
                     }
+                    // Allow synthetic channels to operate alongside each other or when no real data conflicts
                 }
 
                 // We accept the channel switch...clear out any old channel's data
@@ -2526,11 +2541,23 @@ bool LTFlightData::AircraftMaintenance ( double simTime )
         // Tests on an existing aircraft object
         if (hasAc())
         {
+            // Enhanced logic for synthetic aircraft: Check if this is synthetic traffic
+            bool isSyntheticAircraft = false;
+            if (!dynDataDeque.empty()) {
+                const LTChannel* pLastChn = dynDataDeque.back().pChannel;
+                isSyntheticAircraft = (pLastChn && pLastChn->GetChType() == LTChannel::CHT_SYNTHETIC_DATA);
+            }
+            
             // if the a/c became invalid or has flown out of sight
             // then remove the aircraft object,
             // but retain the remaining flight data
-            if (!pAc->IsValid() ||
-                pAc->GetVecView().dist > dataRefs.GetFdStdDistance_m())
+            // For synthetic aircraft, use extended range as they manage their own positioning
+            double maxDistance = dataRefs.GetFdStdDistance_m();
+            if (isSyntheticAircraft) {
+                maxDistance *= 1.5; // Give synthetic aircraft 50% more range before removal
+            }
+            
+            if (!pAc->IsValid() || pAc->GetVecView().dist > maxDistance)
                 DestroyAircraft();
             else {
                 // cover the special case of finishing landing and roll-out without live positions
@@ -2568,9 +2595,31 @@ bool LTFlightData::AircraftMaintenance ( double simTime )
         }
             
         // youngestTS longer ago than allowed? -> remove the entire FD object
-        if (youngestTS + dataRefs.GetAcOutdatedIntvl() <
+        // Enhanced logic: Give synthetic aircraft more time to live as they manage their own lifecycle
+        double outdatedInterval = dataRefs.GetAcOutdatedIntvl();
+        
+        // Check if this flight data is from synthetic traffic channel
+        bool isSyntheticTraffic = false;
+        if (!dynDataDeque.empty()) {
+            const LTChannel* pLastChn = dynDataDeque.back().pChannel;
+            isSyntheticTraffic = (pLastChn && pLastChn->GetChType() == LTChannel::CHT_SYNTHETIC_DATA);
+        }
+        
+        // Give synthetic traffic more time before considering it outdated
+        if (isSyntheticTraffic) {
+            outdatedInterval *= 3.0; // Triple the timeout for synthetic traffic
+        }
+        
+        if (youngestTS + outdatedInterval <
             (std::isnan(simTime) ? dataRefs.GetSimTime() : simTime))
         {
+            // For synthetic traffic, log when we're removing it so we can debug issues
+            if (isSyntheticTraffic) {
+                LOG_MSG(logDEBUG, "Removing synthetic aircraft %s due to data age (%.1fs old, limit %.1fs)", 
+                        keyDbg().c_str(), 
+                        (std::isnan(simTime) ? dataRefs.GetSimTime() : simTime) - youngestTS,
+                        outdatedInterval);
+            }
             SetInvalid(false);
             return true;
         }

@@ -486,6 +486,13 @@ protected:
     void GenerateBasicPath(SynDataTy& synData, const positionTy& currentPos);
     void GenerateHoldingPattern(SynDataTy& synData, const positionTy& currentPos);
     
+    /// Enhanced communication system functions
+    std::string GenerateCommMessage(const SynDataTy& synData, const positionTy& userPos);
+    void ProcessTTSCommunication(SynDataTy& synData, const std::string& message);
+    bool IsUserTunedToFrequency(double frequency);
+    void UpdateCommunicationFrequencies(SynDataTy& synData, const positionTy& userPos);
+    double GetCommunicationInterval(SyntheticFlightState state);
+    
     /// Calculate performance parameters based on aircraft type
     void CalculatePerformance(SynDataTy& synData);
     

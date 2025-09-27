@@ -838,7 +838,7 @@ public:
     int synGARatio = 60;                        ///< Ratio of GA traffic (percentage)
     int synAirlineRatio = 30;                   ///< Ratio of airline traffic (percentage)
     int synMilitaryRatio = 10;                  ///< Ratio of military traffic (percentage)
-    int bSynTTSEnabled = false;                 ///< Enable TTS communications
+    int bSynTTSEnabled = true;                  ///< Enable TTS communications (default enabled for better user experience)
     int bSynUserAwareness = true;               ///< Aircraft react to user presence
     int bSynWeatherOperations = true;           ///< Weather-based operations
     int synCommRange = 25;                      ///< Communications range in nautical miles

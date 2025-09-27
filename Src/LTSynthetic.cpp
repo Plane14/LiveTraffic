@@ -496,13 +496,15 @@ bool SyntheticConnection::ProcessFetchedData ()
             CheckWeatherImpact(synData.pos, synData);
         }
         
-        // Handle TTS communications - make it more frequent and less restrictive
-        if (config.enableTTS && synData.isUserAware && 
-            (tNow - synData.lastCommTime) > 15.0) { // Every 15 seconds max (reduced from 30)
-            std::string commMsg = GenerateCommMessage(synData, posCam);
-            if (!commMsg.empty()) {
-                ProcessTTSCommunication(synData, commMsg);
-                synData.lastCommTime = tNow;
+        // Handle TTS communications - improved timing based on flight state
+        if (config.enableTTS && synData.isUserAware) {
+            double commInterval = GetCommunicationInterval(synData.state);
+            if ((tNow - synData.lastCommTime) > commInterval) {
+                std::string commMsg = GenerateCommMessage(synData, posCam);
+                if (!commMsg.empty()) {
+                    ProcessTTSCommunication(synData, commMsg);
+                    synData.lastCommTime = tNow;
+                }
             }
         }
         
@@ -3028,12 +3030,19 @@ void SyntheticConnection::ProcessTTSCommunication(SynDataTy& synData, const std:
             synData.state, synData.pos.dist(dataRefs.GetViewPos()) / 1852.0,
             synData.isUserAware ? "YES" : "NO");
     
-    // Add insim text output for debugging - display in X-Plane simulator overlay
+    // Add text display for debugging and fallback - use safer text display method
     char freqStr[16];
     snprintf(freqStr, sizeof(freqStr), "%.3f", synData.currentComFreq);
-    std::string insimText = "[SYNTHETIC] " + synData.stat.call + ": " + message + 
+    std::string displayText = "[SYNTHETIC] " + synData.stat.call + ": " + message + 
                            " (" + std::string(freqStr) + " MHz)";
-    XPLMSpeakString(insimText.c_str());
+    
+    // Use XPLMSpeakString for text display (safer than direct speech)
+    try {
+        XPLMSpeakString(displayText.c_str());
+    } catch (...) {
+        // If XPLMSpeakString fails, just log it
+        LOG_MSG(logDEBUG, "Text display: %s", displayText.c_str());
+    }
     
     LOG_MSG(logDEBUG, "TTS: %s on %.3f MHz", message.c_str(), synData.currentComFreq);
     
@@ -3088,9 +3097,9 @@ bool SyntheticConnection::IsUserTunedToFrequency(double frequency)
         double com1FreqMHz = com1FreqHz / 1000000.0;
         double com2FreqMHz = com2FreqHz / 1000000.0;
         
-        // Check if aircraft frequency matches either COM radio (within 0.025 MHz tolerance)
-        bool com1Match = std::abs(frequency - com1FreqMHz) < 0.025;
-        bool com2Match = std::abs(frequency - com2FreqMHz) < 0.025;
+        // Check if aircraft frequency matches either COM radio (within 0.050 MHz tolerance for better user experience)
+        bool com1Match = std::abs(frequency - com1FreqMHz) < 0.050;
+        bool com2Match = std::abs(frequency - com2FreqMHz) < 0.050;
         
         LOG_MSG(logDEBUG, "Frequency check: Aircraft=%.3f MHz, COM1=%.3f MHz, COM2=%.3f MHz, Match=%s", 
                 frequency, com1FreqMHz, com2FreqMHz, (com1Match || com2Match) ? "YES" : "NO");
@@ -3101,6 +3110,35 @@ bool SyntheticConnection::IsUserTunedToFrequency(double frequency)
         LOG_MSG(logWARN, "Exception while checking user radio frequencies, allowing TTS message");
         return true; // On error, allow the message
     }
+}
+
+// Get communication interval based on flight state - more realistic timing
+double SyntheticConnection::GetCommunicationInterval(SyntheticFlightState state)
+{
+    switch (state) {
+        case SYN_STATE_STARTUP:
+            return 45.0; // Startup communications every 45 seconds
+        case SYN_STATE_TAXI_OUT:
+        case SYN_STATE_TAXI_IN:
+            return 30.0; // Taxi communications every 30 seconds
+        case SYN_STATE_LINE_UP_WAIT:
+            return 20.0; // More frequent when waiting on runway
+        case SYN_STATE_TAKEOFF:
+            return 60.0; // Less frequent during takeoff (busy phase)
+        case SYN_STATE_CLIMB:
+        case SYN_STATE_DESCENT:
+            return 45.0; // Moderate frequency during climb/descent
+        case SYN_STATE_CRUISE:
+        case SYN_STATE_HOLD:
+            return 120.0; // Less frequent in cruise (every 2 minutes)
+        case SYN_STATE_APPROACH:
+            return 25.0; // More frequent during approach
+        case SYN_STATE_LANDING:
+            return 60.0; // Less frequent during landing (busy phase)
+        default:
+            return 30.0; // Default interval
+    }
+}
 }
 
 // Update user awareness behavior
@@ -5223,68 +5261,97 @@ void SyntheticConnection::UpdateCommunicationFrequencies(SynDataTy& synData, con
     }
     
     // Determine appropriate frequency based on flight state, position, and proximity to user
-    double newFreq = 121.5; // Default UNICOM
-    std::string freqType = "unicom";
+    double newFreq = 122.8; // Default CTAF/UNICOM
+    std::string freqType = "ctaf";
     
+    // More realistic frequency assignment based on flight operations
     switch (synData.state) {
         case SYN_STATE_PARKED:
         case SYN_STATE_STARTUP:
-            if (minDistance < 5.0) {
-                newFreq = 121.9; // Ground frequency
-                freqType = "ground";
+            if (minDistance < 8.0) { // At or near airport
+                if (synData.trafficType == SYN_TRAFFIC_AIRLINE) {
+                    newFreq = 121.9; // Ground frequency for airlines
+                    freqType = "ground";
+                } else {
+                    newFreq = 122.8; // CTAF for GA
+                    freqType = "ctaf";
+                }
             }
             break;
             
         case SYN_STATE_TAXI_OUT:
         case SYN_STATE_TAXI_IN:
-            if (minDistance < 3.0) {
-                newFreq = 121.9; // Ground frequency
-                freqType = "ground";
+            if (minDistance < 5.0) { // Close to airport
+                if (synData.trafficType == SYN_TRAFFIC_AIRLINE) {
+                    newFreq = 121.9; // Ground frequency
+                    freqType = "ground";
+                } else {
+                    newFreq = 122.8; // CTAF for GA
+                    freqType = "ctaf";
+                }
             } else {
-                newFreq = 121.5; // UNICOM
-                freqType = "unicom";
+                newFreq = 122.8; // CTAF
+                freqType = "ctaf";
             }
             break;
             
         case SYN_STATE_LINE_UP_WAIT:
         case SYN_STATE_TAKEOFF:
         case SYN_STATE_LANDING:
-            if (minDistance < 5.0) {
-                newFreq = 118.1; // Tower frequency
-                freqType = "tower";
+            if (minDistance < 8.0) { // Near airport
+                if (synData.trafficType == SYN_TRAFFIC_AIRLINE) {
+                    newFreq = 118.1; // Tower frequency for controlled airports
+                    freqType = "tower";
+                } else {
+                    newFreq = 122.8; // CTAF for uncontrolled
+                    freqType = "ctaf";
+                }
             }
             break;
             
         case SYN_STATE_APPROACH:
-            if (minDistance < 15.0) {
-                newFreq = 119.1; // Approach frequency  
-                freqType = "approach";
+            if (minDistance < 20.0) { // Within approach control area
+                if (synData.trafficType == SYN_TRAFFIC_AIRLINE) {
+                    newFreq = 119.1; // Approach frequency  
+                    freqType = "approach";
+                } else {
+                    newFreq = 122.8; // CTAF for GA
+                    freqType = "ctaf";
+                }
             } else {
-                newFreq = 120.4; // Center frequency
-                freqType = "center";
+                newFreq = 121.1; // En-route frequency
+                freqType = "enroute";
             }
             break;
             
         case SYN_STATE_CLIMB:
-            if (synData.pos.alt_m() > 3000.0) { // Above 10,000 feet
-                newFreq = 120.4; // Center frequency
-                freqType = "center";
-            } else {
-                newFreq = 119.1; // Approach/departure frequency
+            if (synData.pos.alt_m() > 3048.0) { // Above 10,000 feet MSL
+                newFreq = 121.1; // En-route frequency
+                freqType = "enroute";
+            } else if (minDistance < 25.0) { // Within departure control area
+                newFreq = 119.3; // Departure frequency
                 freqType = "departure";
+            } else {
+                newFreq = 122.8; // CTAF
+                freqType = "ctaf";
             }
             break;
             
         case SYN_STATE_CRUISE:
         case SYN_STATE_HOLD:
         case SYN_STATE_DESCENT:
-            newFreq = 120.4; // Center frequency
-            freqType = "center";
+            if (synData.pos.alt_m() > 5486.4) { // Above 18,000 feet (Class A airspace)
+                newFreq = 121.1; // Center frequency
+                freqType = "center";
+            } else {
+                newFreq = 121.1; // En-route frequency
+                freqType = "enroute";
+            }
             break;
             
         default:
-            newFreq = 121.5; // UNICOM
-            freqType = "unicom";
+            newFreq = 122.8; // CTAF (more common than UNICOM)
+            freqType = "ctaf";
             break;
     }
     

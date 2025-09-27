@@ -196,6 +196,12 @@ protected:
         std::string alternateAirport;           ///< alternate airport for diversion
         double lastWeatherCheck;                ///< time of last weather condition check for approach decisions
         
+        // Flight duration and cleanup tracking
+        double flightStartTime;                 ///< time when flight started (departed or took off)
+        double maxFlightDuration;               ///< maximum allowed flight duration in seconds
+        double lastStateProgressCheck;          ///< time of last check for state progression
+        bool markedForCleanup;                  ///< flag to mark aircraft for removal
+        
         SynDataTy() : currentWaypoint(0), lastTerrainCheck(0.0), terrainElevation(0.0), 
                      terrainProbe(nullptr), headingChangeRate(2.0), targetHeading(0.0),
                      lastTCASCheck(0.0), tcasActive(true), tcasAdvisory(""),
@@ -208,7 +214,8 @@ protected:
                      currentComFreq(121.5), currentAirport(""), destinationAirport(""), currentFreqType("unicom"), lastFreqUpdate(0.0),
                      currentTaxiWaypoint(0), assignedGate(""), groundCollisionAvoidance(false),
                      lastCSLScanTime(0.0), goAroundAttempts(0), lastGoAroundTime(0.0), 
-                     weatherDiversionRequired(false), alternateAirport(""), lastWeatherCheck(0.0) {}
+                     weatherDiversionRequired(false), alternateAirport(""), lastWeatherCheck(0.0),
+                     flightStartTime(0.0), maxFlightDuration(3600.0), lastStateProgressCheck(0.0), markedForCleanup(false) {}
         
         ~SynDataTy() {
             // Thread-safe cleanup of terrain probe
@@ -533,6 +540,15 @@ protected:
     
     /// Calculate performance parameters based on aircraft type
     void CalculatePerformance(SynDataTy& synData);
+    
+    /// Check for stuck aircraft and enforce flight duration limits
+    bool CheckFlightDurationLimits(SynDataTy& synData, double currentTime);
+    
+    /// Force aircraft to complete flight cycle if stuck
+    void ForceFlightCompletion(SynDataTy& synData, double currentTime);
+    
+    /// Enhanced destination validation and flight completion logic
+    bool ValidateDestinationAndComplete(SynDataTy& synData, double currentTime);
     
     /// Get aircraft performance data for a specific ICAO type
     const AircraftPerformance* GetAircraftPerformance(const std::string& icaoType) const;

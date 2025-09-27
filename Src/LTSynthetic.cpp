@@ -479,6 +479,22 @@ bool SyntheticConnection::ProcessFetchedData ()
             continue;
         }
         
+        // Check flight duration limits and handle stuck aircraft
+        try {
+            if (CheckFlightDurationLimits(synData, tNow)) {
+                if (synData.markedForCleanup) {
+                    LOG_MSG(logDEBUG, "Removing aircraft %s marked for cleanup", synData.stat.call.c_str());
+                    i = mapSynData.erase(i);
+                    continue;
+                } else {
+                    // Force progression for stuck aircraft
+                    ForceFlightCompletion(synData, tNow);
+                }
+            }
+        } catch (...) {
+            LOG_MSG(logWARN, "Exception in CheckFlightDurationLimits for %s", synData.stat.call.c_str());
+        }
+        
         // Update user awareness if enabled
         if (config.userAwareness) {
             try {
@@ -1687,43 +1703,41 @@ void SyntheticConnection::UpdateAIBehavior(SynDataTy& synData, double currentTim
                 break;
                 
             case SYN_STATE_CRUISE:
-                // Enhanced cruise behavior with realistic decision making
+                // Enhanced cruise behavior with realistic decision making and duration limits
                 {
                     double cruiseTime = currentTime - synData.stateChangeTime;
+                    double totalFlightTime = synData.flightStartTime > 0 ? currentTime - synData.flightStartTime : cruiseTime;
                     
-                    // Check if near destination airport and should start descent
-                    if (!synData.destinationAirport.empty()) {
-                        positionTy airportPos = GetAirportPosition(synData.destinationAirport);
-                        if (airportPos.isNormal()) {
-                            double distanceToAirport = synData.pos.dist(airportPos);
-                            // Start descent when within reasonable distance based on altitude
-                            double descentDistance = std::max(15000.0, (synData.pos.alt_m() - synData.terrainElevation - 300.0) * 8.0); // ~8:1 descent ratio
-                            
-                            if (distanceToAirport < descentDistance && cruiseTime > 300.0) { // At least 5 min cruise
-                                newState = SYN_STATE_DESCENT;
-                                SetRealisticDescentParameters(synData);
-                                LOG_MSG(logDEBUG, "Aircraft %s beginning descent to %s (%.1f nm away)", 
-                                        synData.stat.call.c_str(), synData.destinationAirport.c_str(), distanceToAirport / 1852.0);
-                                break; // Exit the case early
-                            }
-                        }
+                    // Check flight duration limits - force landing if exceeding maximum duration
+                    if (totalFlightTime > synData.maxFlightDuration) {
+                        newState = SYN_STATE_DESCENT;
+                        SetRealisticDescentParameters(synData);
+                        LOG_MSG(logDEBUG, "Aircraft %s forced to descend after %.1f minutes of flight (duration limit)", 
+                                synData.stat.call.c_str(), totalFlightTime / 60.0);
+                        break;
                     }
                     
-                    // Original random behavior as fallback or if no valid destination
+                    // Enhanced destination validation and approach logic
+                    if (ValidateDestinationAndComplete(synData, currentTime)) {
+                        // Destination-based descent was initiated in ValidateDestinationAndComplete
+                        break;
+                    }
+                    
+                    // Original random behavior as fallback with improved probabilities
                     int decision = std::rand() % 100;
                     
                     if (cruiseTime > 1800.0) { // After 30 minutes, more likely to descend
-                        if (decision < 60) { // 60% chance to descend
+                        if (decision < 80) { // Increased to 80% chance to descend
                             newState = SYN_STATE_DESCENT;
                             SetRealisticDescentParameters(synData);
                             LOG_MSG(logDEBUG, "Aircraft %s beginning descent after long cruise", synData.stat.call.c_str());
                         }
                     } else if (cruiseTime > 600.0) { // After 10 minutes of cruise
-                        if (decision < 15) { // 15% chance to enter holding
+                        if (decision < 10) { // Reduced to 10% chance to enter holding
                             newState = SYN_STATE_HOLD;
                             synData.holdingTime = 0.0; // Reset holding time
                             LOG_MSG(logDEBUG, "Aircraft %s entering holding pattern", synData.stat.call.c_str());
-                        } else if (decision < 35) { // 20% chance to start descent
+                        } else if (decision < 45) { // Increased to 35% chance to start descent
                             newState = SYN_STATE_DESCENT;
                             SetRealisticDescentParameters(synData);
                             LOG_MSG(logDEBUG, "Aircraft %s beginning descent", synData.stat.call.c_str());
@@ -1735,13 +1749,16 @@ void SyntheticConnection::UpdateAIBehavior(SynDataTy& synData, double currentTim
             case SYN_STATE_HOLD:
                 {
                     synData.holdingTime += currentTime - synData.stateChangeTime;
-                    // Hold for 2-10 minutes with realistic probability distribution
-                    double holdDuration = 120.0 + (std::rand() % 480); // 2-10 minutes
-                    if (synData.holdingTime > holdDuration) {
+                    // Enhanced hold logic to prevent endless patterns
+                    double holdDuration = 120.0 + (std::rand() % 360); // 2-8 minutes (reduced max)
+                    double totalFlightTime = synData.flightStartTime > 0 ? currentTime - synData.flightStartTime : synData.holdingTime;
+                    
+                    // Force exit from hold if flight is getting too long or hold duration exceeded
+                    if (synData.holdingTime > holdDuration || totalFlightTime > synData.maxFlightDuration * 0.8) {
                         newState = SYN_STATE_DESCENT;
                         SetRealisticDescentParameters(synData);
-                        LOG_MSG(logDEBUG, "Aircraft %s leaving hold after %.1f minutes", 
-                                synData.stat.call.c_str(), synData.holdingTime / 60.0);
+                        LOG_MSG(logDEBUG, "Aircraft %s leaving hold after %.1f minutes (flight time: %.1f min)", 
+                                synData.stat.call.c_str(), synData.holdingTime / 60.0, totalFlightTime / 60.0);
                     }
                 }
                 break;
@@ -2075,6 +2092,36 @@ void SyntheticConnection::HandleStateTransition(SynDataTy& synData, SyntheticFli
     
     synData.state = newState;
     synData.stateChangeTime = currentTime;
+    
+    // Track flight start time and set duration limits
+    if (newState == SYN_STATE_TAKEOFF_ROLL && synData.flightStartTime == 0.0) {
+        synData.flightStartTime = currentTime;
+        
+        // Set realistic maximum flight duration based on aircraft type
+        switch (synData.trafficType) {
+            case SYN_TRAFFIC_GA:
+                synData.maxFlightDuration = 1800.0 + (std::rand() % 1800); // 30-60 minutes
+                break;
+            case SYN_TRAFFIC_AIRLINE:
+                synData.maxFlightDuration = 3600.0 + (std::rand() % 5400); // 1-2.5 hours
+                break;
+            case SYN_TRAFFIC_MILITARY:
+                synData.maxFlightDuration = 2700.0 + (std::rand() % 3600); // 45-105 minutes
+                break;
+            case SYN_TRAFFIC_NONE:
+            case SYN_TRAFFIC_ALL:
+            default:
+                synData.maxFlightDuration = 2400.0 + (std::rand() % 2400); // 40-80 minutes
+                break;
+        }
+        
+        LOG_MSG(logDEBUG, "Aircraft %s flight started, max duration %.1f minutes", 
+                synData.stat.call.c_str(), synData.maxFlightDuration / 60.0);
+    }
+    
+    // Reset cleanup flag when making progress
+    synData.markedForCleanup = false;
+    synData.lastStateProgressCheck = currentTime;
     
     // Set next event time based on new state
     switch (newState) {
@@ -9518,4 +9565,156 @@ std::string SyntheticConnection::GenerateRealisticSTARName(const std::string& ai
     starName += "ARR";
     
     return starName;
+}
+
+// Check for stuck aircraft and enforce flight duration limits
+bool SyntheticConnection::CheckFlightDurationLimits(SynDataTy& synData, double currentTime)
+{
+    // Check if aircraft has been in flight too long
+    if (synData.flightStartTime > 0.0) {
+        double flightDuration = currentTime - synData.flightStartTime;
+        
+        if (flightDuration > synData.maxFlightDuration) {
+            LOG_MSG(logWARN, "Aircraft %s exceeded maximum flight duration (%.1f minutes), forcing completion", 
+                    synData.stat.call.c_str(), flightDuration / 60.0);
+            synData.markedForCleanup = true;
+            return true;
+        }
+    }
+    
+    // Check if aircraft has been stuck in the same state for too long
+    double stateTime = currentTime - synData.stateChangeTime;
+    double maxStateTime = 1800.0; // 30 minutes default
+    
+    switch (synData.state) {
+        case SYN_STATE_PARKED:
+        case SYN_STATE_SHUTDOWN:
+            maxStateTime = 3600.0; // 1 hour for parked/shutdown
+            break;
+        case SYN_STATE_CRUISE:
+            maxStateTime = 2700.0; // 45 minutes for cruise
+            break;
+        case SYN_STATE_HOLD:
+            maxStateTime = 600.0; // 10 minutes for holding
+            break;
+        default:
+            maxStateTime = 1800.0; // 30 minutes for other states
+            break;
+    }
+    
+    if (stateTime > maxStateTime) {
+        LOG_MSG(logWARN, "Aircraft %s stuck in state %d for %.1f minutes, forcing progression", 
+                synData.stat.call.c_str(), synData.state, stateTime / 60.0);
+        return true;
+    }
+    
+    return false;
+}
+
+// Force aircraft to complete flight cycle if stuck
+void SyntheticConnection::ForceFlightCompletion(SynDataTy& synData, double currentTime)
+{
+    LOG_MSG(logDEBUG, "Forcing flight completion for stuck aircraft %s in state %d", 
+            synData.stat.call.c_str(), synData.state);
+    
+    // Force progression based on current state
+    switch (synData.state) {
+        case SYN_STATE_CRUISE:
+        case SYN_STATE_HOLD:
+            // Force descent
+            HandleStateTransition(synData, SYN_STATE_DESCENT, currentTime);
+            SetRealisticDescentParameters(synData);
+            break;
+            
+        case SYN_STATE_DESCENT:
+            // Force approach
+            HandleStateTransition(synData, SYN_STATE_APPROACH, currentTime);
+            break;
+            
+        case SYN_STATE_APPROACH:
+            // Force final approach
+            HandleStateTransition(synData, SYN_STATE_FINAL, currentTime);
+            break;
+            
+        case SYN_STATE_FINAL:
+            // Force landing
+            HandleStateTransition(synData, SYN_STATE_FLARE, currentTime);
+            break;
+            
+        case SYN_STATE_FLARE:
+            // Force touchdown
+            HandleStateTransition(synData, SYN_STATE_TOUCH_DOWN, currentTime);
+            break;
+            
+        case SYN_STATE_TOUCH_DOWN:
+            // Force rollout
+            HandleStateTransition(synData, SYN_STATE_ROLL_OUT, currentTime);
+            break;
+            
+        case SYN_STATE_ROLL_OUT:
+            // Force taxi in
+            HandleStateTransition(synData, SYN_STATE_TAXI_IN, currentTime);
+            break;
+            
+        case SYN_STATE_TAXI_IN:
+            // Force shutdown
+            HandleStateTransition(synData, SYN_STATE_SHUTDOWN, currentTime);
+            break;
+            
+        case SYN_STATE_SHUTDOWN:
+            // Force parking (complete cycle)
+            HandleStateTransition(synData, SYN_STATE_PARKED, currentTime);
+            break;
+            
+        default:
+            // For other states, mark for cleanup
+            synData.markedForCleanup = true;
+            break;
+    }
+}
+
+// Enhanced destination validation and flight completion logic
+bool SyntheticConnection::ValidateDestinationAndComplete(SynDataTy& synData, double currentTime)
+{
+    // Check if we have a valid destination
+    if (synData.destinationAirport.empty()) {
+        // Try to find a nearby airport as destination
+        std::vector<std::string> nearbyAirports = FindNearbyAirports(synData.pos, 100.0); // Within 100nm
+        if (!nearbyAirports.empty()) {
+            synData.destinationAirport = nearbyAirports[0];
+            LOG_MSG(logDEBUG, "Aircraft %s assigned new destination %s", 
+                    synData.stat.call.c_str(), synData.destinationAirport.c_str());
+        } else {
+            // No suitable destination found, force descent after reasonable time
+            double cruiseTime = currentTime - synData.stateChangeTime;
+            if (cruiseTime > 900.0) { // After 15 minutes without destination
+                LOG_MSG(logDEBUG, "Aircraft %s beginning descent (no destination found)", 
+                        synData.stat.call.c_str());
+                return true; // Signal to transition to descent
+            }
+            return false;
+        }
+    }
+    
+    // Check distance to destination
+    positionTy airportPos = GetAirportPosition(synData.destinationAirport);
+    if (airportPos.isNormal()) {
+        double distanceToAirport = synData.pos.dist(airportPos);
+        double currentAltitude = synData.pos.alt_m() - synData.terrainElevation;
+        
+        // Calculate descent distance based on altitude (approximately 3-degree descent path)
+        double descentDistance = std::max(10000.0, currentAltitude * 8.0); // 8:1 ratio minimum 10km
+        
+        if (distanceToAirport < descentDistance) {
+            // Within descent range, initiate descent
+            HandleStateTransition(synData, SYN_STATE_DESCENT, currentTime);
+            SetRealisticDescentParameters(synData);
+            LOG_MSG(logDEBUG, "Aircraft %s beginning descent to %s (%.1f nm away, %.0f ft altitude)", 
+                    synData.stat.call.c_str(), synData.destinationAirport.c_str(), 
+                    distanceToAirport / 1852.0, currentAltitude * 3.28084);
+            return true;
+        }
+    }
+    
+    return false;
 }

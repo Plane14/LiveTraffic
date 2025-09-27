@@ -630,31 +630,63 @@ bool SyntheticConnection::ProcessFetchedData ()
                 break;
             case SYN_STATE_TAKEOFF:
                 synData.pos.f.flightPhase = FPH_TAKE_OFF;
-                dyn.vsi = 500.0; // 500 ft/min climb
+                // More realistic takeoff climb rate based on aircraft type
+                if (synData.trafficType == SYN_TRAFFIC_GA) {
+                    dyn.vsi = 800.0; // GA aircraft: 800 ft/min initial climb
+                } else if (synData.trafficType == SYN_TRAFFIC_AIRLINE) {
+                    dyn.vsi = 1200.0; // Airlines: 1200 ft/min initial climb  
+                } else {
+                    dyn.vsi = 1000.0; // Military/default: 1000 ft/min
+                }
                 break;
             case SYN_STATE_CLIMB:
                 synData.pos.f.flightPhase = FPH_CLIMB;
-                dyn.vsi = 1500.0; // 1500 ft/min climb
+                // Adjust climb rate by aircraft type and current altitude
+                if (synData.pos.alt_m() > 3000.0) { // Above 10,000 ft, reduce climb rate
+                    if (synData.trafficType == SYN_TRAFFIC_GA) {
+                        dyn.vsi = 600.0; // GA: reduced climb at altitude
+                    } else {
+                        dyn.vsi = 1000.0; // Larger aircraft: still good climb rate
+                    }
+                } else {
+                    if (synData.trafficType == SYN_TRAFFIC_GA) {
+                        dyn.vsi = 800.0; // GA: good initial climb
+                    } else {
+                        dyn.vsi = 1500.0; // Airline/military: strong initial climb
+                    }
+                }
                 break;
             case SYN_STATE_CRUISE:
                 synData.pos.f.flightPhase = FPH_CRUISE;
-                dyn.vsi = 0.0;
+                // Small variations in cruise to simulate minor altitude adjustments
+                dyn.vsi = (std::rand() % 201 - 100) / 10.0; // ±10 ft/min variation
                 break;
             case SYN_STATE_HOLD:
                 synData.pos.f.flightPhase = FPH_CRUISE;
-                dyn.vsi = 0.0;
+                dyn.vsi = 0.0; // Steady in hold
                 break;
             case SYN_STATE_DESCENT:
                 synData.pos.f.flightPhase = FPH_DESCEND;
-                dyn.vsi = -1000.0; // 1000 ft/min descent
+                // More realistic descent rates by aircraft type
+                if (synData.trafficType == SYN_TRAFFIC_GA) {
+                    dyn.vsi = -600.0; // GA: gentler descent
+                } else {
+                    dyn.vsi = -1200.0; // Airlines: efficient descent
+                }
                 break;
             case SYN_STATE_APPROACH:
                 synData.pos.f.flightPhase = FPH_APPROACH;
-                dyn.vsi = -500.0; // 500 ft/min descent
+                // Stabilized approach descent rate
+                dyn.vsi = -700.0; // Standard approach rate 700 ft/min
                 break;
             case SYN_STATE_LANDING:
                 synData.pos.f.flightPhase = FPH_LANDING;
-                dyn.vsi = -200.0; // 200 ft/min descent
+                // Final approach/landing descent
+                if (synData.pos.alt_m() > 150.0) { // Above 500 ft AGL
+                    dyn.vsi = -650.0; // Final approach rate
+                } else {
+                    dyn.vsi = -300.0; // Shallow final descent for touchdown
+                }
                 break;
             default:
                 synData.pos.f.flightPhase = FPH_UNKNOWN;
@@ -3916,7 +3948,29 @@ void SyntheticConnection::UpdateNavigation(SynDataTy& synData, double currentTim
         double distanceToWaypoint = synData.pos.dist(synData.targetWaypoint);
         double waypointTolerance = GetWaypointTolerance(synData.state, synData.trafficType);
         
+        // Implement look-ahead for smoother navigation
+        bool shouldAdvanceWaypoint = false;
+        
         if (distanceToWaypoint < waypointTolerance) {
+            shouldAdvanceWaypoint = true;
+        } else if (synData.currentWaypoint + 1 < synData.flightPath.size()) {
+            // Look ahead for smoother turns - advance waypoint early if we're turning towards the next one
+            positionTy nextWaypoint = synData.flightPath[synData.currentWaypoint + 1];
+            double bearingToNext = synData.pos.angle(nextWaypoint);
+            double currentBearing = synData.pos.angle(synData.targetWaypoint);
+            
+            double turnAngle = std::abs(bearingToNext - currentBearing);
+            if (turnAngle > 180.0) turnAngle = 360.0 - turnAngle;
+            
+            // If we're within a reasonable distance and the turn angle is significant, advance early
+            if (distanceToWaypoint < waypointTolerance * 2.0 && turnAngle > 30.0) {
+                shouldAdvanceWaypoint = true;
+                LOG_MSG(logDEBUG, "Aircraft %s advancing waypoint early for smooth turn (angle=%.1f°)", 
+                        synData.stat.call.c_str(), turnAngle);
+            }
+        }
+        
+        if (shouldAdvanceWaypoint) {
             synData.currentWaypoint++;
             
             if (synData.currentWaypoint < synData.flightPath.size()) {
@@ -4051,8 +4105,34 @@ double SyntheticConnection::ApplyCruiseNavigation(SynDataTy& synData, double bea
     while (headingDiff > 180.0) headingDiff -= 360.0;
     while (headingDiff < -180.0) headingDiff += 360.0;
     
-    // More aggressive turns allowed in cruise
-    double maxHeadingChange = 3.0; // degrees per update for cruise
+    // Calculate distance to current waypoint for better turn management
+    double waypointDistance = 0.0;
+    if (synData.currentWaypoint < synData.flightPath.size()) {
+        waypointDistance = synData.pos.dist(synData.flightPath[synData.currentWaypoint]);
+    }
+    
+    // Adjust turn rate based on distance to waypoint and required turn angle
+    double maxHeadingChange;
+    
+    if (waypointDistance < 2000.0) { // Within 2km of waypoint
+        // Anticipate turn for smooth waypoint passage
+        if (std::abs(headingDiff) > 45.0) {
+            maxHeadingChange = 4.0; // More aggressive turn when close to sharp turn
+        } else {
+            maxHeadingChange = 2.5; // Standard close-in navigation
+        }
+    } else {
+        // Far from waypoint, use standard cruise navigation
+        maxHeadingChange = 1.5; // Smooth cruise navigation
+    }
+    
+    // Additional smoothing for aircraft type
+    if (synData.trafficType == SYN_TRAFFIC_AIRLINE) {
+        maxHeadingChange *= 0.8; // Airlines turn more gradually
+    } else if (synData.trafficType == SYN_TRAFFIC_GA) {
+        maxHeadingChange *= 1.2; // GA aircraft can turn slightly faster
+    }
+    
     if (std::abs(headingDiff) > maxHeadingChange) {
         headingDiff = (headingDiff > 0) ? maxHeadingChange : -maxHeadingChange;
     }
@@ -4286,7 +4366,7 @@ void SyntheticConnection::GenerateCruisePath(SynDataTy& synData, const positionT
     }
 }
 
-// Generate arrival flight path with STAR procedures
+// Generate realistic arrival path with standard approach procedures
 void SyntheticConnection::GenerateArrivalPath(SynDataTy& synData, const positionTy& currentPos)
 {
     // If we have a destination airport, create approach path to it
@@ -4301,45 +4381,61 @@ void SyntheticConnection::GenerateArrivalPath(SynDataTy& synData, const position
             double bearing = currentPos.angle(airportPos);
             double distance = currentPos.dist(airportPos);
             
-            // Generate approach waypoints at strategic distances
-            std::vector<double> approachDistances = {0.75, 0.5, 0.3, 0.1}; // Fractions of total distance
+            // Implement a more realistic approach pattern with standard fixes
             
-            for (double fraction : approachDistances) {
-                positionTy waypoint;
-                
-                // Interpolate position between current and airport
-                waypoint.lat() = currentPos.lat() + (airportPos.lat() - currentPos.lat()) * fraction;
-                waypoint.lon() = currentPos.lon() + (airportPos.lon() - currentPos.lon()) * fraction;
-                
-                // Descend progressively toward airport
-                double descentFraction = 1.0 - fraction;  // Higher as we get closer
-                waypoint.alt_m() = currentPos.alt_m() - (descentFraction * (currentPos.alt_m() - synData.terrainElevation - 300.0));
-                
-                // Ensure minimum safe altitude
-                waypoint.alt_m() = std::max(waypoint.alt_m(), synData.terrainElevation + 300.0);
-                
-                synData.flightPath.push_back(waypoint);
-            }
+            // Initial approach fix (typically 20-30nm from airport)
+            double initialDistance = std::min(distance * 0.7, 55560.0); // ~30nm max
+            positionTy initialFix;
+            initialFix.lat() = airportPos.lat() - (initialDistance / 111320.0) * std::cos(bearing * PI / 180.0);
+            initialFix.lon() = airportPos.lon() - (initialDistance / (111320.0 * std::cos(airportPos.lat() * PI / 180.0))) * std::sin(bearing * PI / 180.0);
+            initialFix.alt_m() = std::max(currentPos.alt_m() * 0.6, synData.terrainElevation + 1500.0); // Reasonable approach altitude
+            synData.flightPath.push_back(initialFix);
             
-            // Final waypoint at the airport runway level for landing
-            airportPos.alt_m() = synData.terrainElevation + 10.0; // 10m above ground (runway level)
-            synData.flightPath.push_back(airportPos);
+            // Intermediate approach fix (typically 10-15nm from airport)
+            double intermediateDistance = 18520.0; // ~10nm
+            positionTy intermediateFix;
+            intermediateFix.lat() = airportPos.lat() - (intermediateDistance / 111320.0) * std::cos(bearing * PI / 180.0);
+            intermediateFix.lon() = airportPos.lon() - (intermediateDistance / (111320.0 * std::cos(airportPos.lat() * PI / 180.0))) * std::sin(bearing * PI / 180.0);
+            intermediateFix.alt_m() = synData.terrainElevation + 1000.0; // Lower approach altitude
+            synData.flightPath.push_back(intermediateFix);
             
-            LOG_MSG(logDEBUG, "Generated airport approach path to %s for aircraft %s with %zu waypoints", 
+            // Final approach fix (typically 4-6nm from airport)
+            double finalDistance = 9260.0; // ~5nm
+            positionTy finalFix;
+            finalFix.lat() = airportPos.lat() - (finalDistance / 111320.0) * std::cos(bearing * PI / 180.0);
+            finalFix.lon() = airportPos.lon() - (finalDistance / (111320.0 * std::cos(airportPos.lat() * PI / 180.0))) * std::sin(bearing * PI / 180.0);
+            finalFix.alt_m() = synData.terrainElevation + 500.0; // Final approach altitude
+            synData.flightPath.push_back(finalFix);
+            
+            // Add decision height point (typically 200ft AGL at ~1nm from runway)
+            double decisionDistance = 1852.0; // ~1nm
+            positionTy decisionPoint;
+            decisionPoint.lat() = airportPos.lat() - (decisionDistance / 111320.0) * std::cos(bearing * PI / 180.0);
+            decisionPoint.lon() = airportPos.lon() - (decisionDistance / (111320.0 * std::cos(airportPos.lat() * PI / 180.0))) * std::sin(bearing * PI / 180.0);
+            decisionPoint.alt_m() = synData.terrainElevation + 60.0; // 200ft AGL decision height
+            synData.flightPath.push_back(decisionPoint);
+            
+            // Final waypoint at the airport runway threshold
+            positionTy runwayThreshold = airportPos;
+            runwayThreshold.alt_m() = synData.terrainElevation + 5.0; // 5m above ground at runway threshold
+            synData.flightPath.push_back(runwayThreshold);
+            
+            LOG_MSG(logDEBUG, "Generated realistic approach path to %s for aircraft %s with %zu waypoints", 
                     synData.destinationAirport.c_str(), synData.stat.call.c_str(), synData.flightPath.size());
             return;
         }
     }
     
-    // Fallback to original random path if no destination airport or airport not found
+    // Fallback to simplified descent pattern if no destination airport
     positionTy waypoint = currentPos;
     
-    // Add arrival waypoints with descending altitudes
+    // Create a simple descending pattern
+    double descentRate = (currentPos.alt_m() - synData.terrainElevation - 300.0) / 5.0; // Spread descent over 5 waypoints
+    
     for (int i = 1; i <= 5; i++) {
-        waypoint.lat() += (std::rand() % 15 - 7) / 1000.0; // Tighter pattern
+        waypoint.lat() += (std::rand() % 15 - 7) / 1000.0; // Tighter pattern for approach
         waypoint.lon() += (std::rand() % 15 - 7) / 1000.0;
-        waypoint.alt_m() = currentPos.alt_m() - (i * 200.0); // Gradual descent
-        waypoint.alt_m() = std::max(waypoint.alt_m(), synData.terrainElevation + 300.0); // Stay above ground
+        waypoint.alt_m() = std::max(currentPos.alt_m() - (i * descentRate), synData.terrainElevation + 300.0);
         synData.flightPath.push_back(waypoint);
     }
 }
@@ -5234,29 +5330,65 @@ void SyntheticConnection::UpdateGroundOperations(SynDataTy& synData, double curr
     }
 }
 
-// Generate taxi route waypoints
+// Generate realistic taxi route waypoints with intermediate points
 void SyntheticConnection::GenerateTaxiRoute(SynDataTy& synData, const positionTy& origin, const positionTy& destination)
 {
     synData.taxiRoute.clear();
     synData.currentTaxiWaypoint = 0;
     
-    // Simple taxi route generation - in reality would use airport taxi diagram
-    positionTy waypoint1 = origin;
-    positionTy waypoint2 = destination;
+    // Calculate total distance and create waypoints based on distance
+    double totalDistance = origin.dist(destination);
     
-    // Add intermediate waypoint(s) for realistic taxi path
-    positionTy intermediate;
-    intermediate.lat() = (origin.lat() + destination.lat()) / 2.0;
-    intermediate.lon() = (origin.lon() + destination.lon()) / 2.0;
-    intermediate.alt_m() = origin.alt_m();
-    intermediate.heading() = origin.angle(destination);
+    // Start from origin
+    synData.taxiRoute.push_back(origin);
     
-    synData.taxiRoute.push_back(waypoint1);
-    synData.taxiRoute.push_back(intermediate);
-    synData.taxiRoute.push_back(waypoint2);
+    // For longer taxi routes, add more intermediate waypoints
+    if (totalDistance > 500.0) { // More than 500m
+        int numIntermediatePoints = std::min(5, static_cast<int>(totalDistance / 200.0)); // One waypoint every 200m
+        
+        for (int i = 1; i <= numIntermediatePoints; i++) {
+            double fraction = static_cast<double>(i) / static_cast<double>(numIntermediatePoints + 1);
+            
+            positionTy waypoint;
+            waypoint.lat() = origin.lat() + (destination.lat() - origin.lat()) * fraction;
+            waypoint.lon() = origin.lon() + (destination.lon() - origin.lon()) * fraction;
+            waypoint.alt_m() = origin.alt_m(); // Stay on ground
+            
+            // Add slight random variations to simulate realistic taxi paths (avoiding straight lines)
+            double variation = 0.00005; // Small variation in degrees (~5m)
+            waypoint.lat() += (std::rand() % 200 - 100) / 1000000.0 * variation;
+            waypoint.lon() += (std::rand() % 200 - 100) / 1000000.0 * variation;
+            
+            // Calculate heading to next point (either next waypoint or destination)
+            if (i < numIntermediatePoints) {
+                positionTy nextPoint;
+                nextPoint.lat() = origin.lat() + (destination.lat() - origin.lat()) * (fraction + 1.0/(numIntermediatePoints + 1));
+                nextPoint.lon() = origin.lon() + (destination.lon() - origin.lon()) * (fraction + 1.0/(numIntermediatePoints + 1));
+                waypoint.heading() = waypoint.angle(nextPoint);
+            } else {
+                waypoint.heading() = waypoint.angle(destination);
+            }
+            
+            synData.taxiRoute.push_back(waypoint);
+        }
+    } else {
+        // For shorter distances, just add one intermediate point
+        positionTy intermediate;
+        intermediate.lat() = (origin.lat() + destination.lat()) / 2.0;
+        intermediate.lon() = (origin.lon() + destination.lon()) / 2.0;
+        intermediate.alt_m() = origin.alt_m();
+        intermediate.heading() = intermediate.angle(destination);
+        
+        synData.taxiRoute.push_back(intermediate);
+    }
     
-    LOG_MSG(logDEBUG, "Generated taxi route for %s with %zu waypoints", 
-            synData.stat.call.c_str(), synData.taxiRoute.size());
+    // Add final destination
+    positionTy finalDestination = destination;
+    finalDestination.heading() = synData.taxiRoute.back().angle(destination);
+    synData.taxiRoute.push_back(finalDestination);
+    
+    LOG_MSG(logDEBUG, "Generated taxi route for %s with %zu waypoints (total distance: %.0fm)", 
+            synData.stat.call.c_str(), synData.taxiRoute.size(), totalDistance);
 }
 
 // Check for potential ground collisions with other aircraft
@@ -5295,19 +5427,22 @@ bool SyntheticConnection::CheckGroundCollision(const SynDataTy& synData, const p
 void SyntheticConnection::UpdateTaxiMovement(SynDataTy& synData, double deltaTime)
 {
     if (synData.taxiRoute.empty() || synData.currentTaxiWaypoint >= synData.taxiRoute.size()) {
+        // No taxi route, maintain stationary
+        synData.targetSpeed = 0.0;
         return;
     }
     
     positionTy& currentWaypoint = synData.taxiRoute[synData.currentTaxiWaypoint];
     double distanceToWaypoint = synData.pos.dist(currentWaypoint);
     
-    // Check if we've reached the current waypoint (within 10 meters)
-    if (distanceToWaypoint < 10.0) {
+    // Check if we've reached the current waypoint (within 5 meters for more precision)
+    if (distanceToWaypoint < 5.0) {
         synData.currentTaxiWaypoint++;
         
         if (synData.currentTaxiWaypoint >= synData.taxiRoute.size()) {
-            // Reached destination
+            // Reached destination - stop
             LOG_MSG(logDEBUG, "Aircraft %s completed taxi route", synData.stat.call.c_str());
+            synData.targetSpeed = 0.0;
             return;
         }
         
@@ -5316,27 +5451,58 @@ void SyntheticConnection::UpdateTaxiMovement(SynDataTy& synData, double deltaTim
         distanceToWaypoint = synData.pos.dist(currentWaypoint);
     }
     
-    // Update heading towards current waypoint
+    // Update heading towards current waypoint with smoother turning for ground ops
     double targetHeading = synData.pos.angle(currentWaypoint);
-    SmoothHeadingChange(synData, targetHeading, deltaTime);
     
-    // Adjust speed based on proximity to waypoint and other factors
-    double targetSpeed = synData.targetSpeed;
+    // More gradual heading changes for ground operations
+    double currentHeading = synData.pos.heading();
+    double headingDiff = targetHeading - currentHeading;
     
-    // Slow down when approaching waypoints
-    if (distanceToWaypoint < 50.0) {
-        targetSpeed *= 0.5; // Half speed when close to waypoint
+    // Normalize heading difference
+    while (headingDiff > 180.0) headingDiff -= 360.0;
+    while (headingDiff < -180.0) headingDiff += 360.0;
+    
+    // Limit turning rate for realistic taxi behavior (max 30 degrees per second)
+    double maxTurnRate = 30.0 * deltaTime;
+    if (std::abs(headingDiff) > maxTurnRate) {
+        headingDiff = (headingDiff > 0) ? maxTurnRate : -maxTurnRate;
     }
     
-    // Further reduce speed in congested areas (simplified check)
-    if (synData.groundCollisionAvoidance) {
-        targetSpeed *= 0.7;
-    }
+    synData.pos.heading() = currentHeading + headingDiff;
+    synData.targetHeading = synData.pos.heading();
     
-    // Update target speed with taxi-specific limitations
+    // Calculate realistic taxi speed based on multiple factors
     const AircraftPerformance* perfData = GetAircraftPerformance(synData.stat.acTypeIcao);
-    double maxTaxiSpeed = perfData ? perfData->taxiSpeedKts * 0.514444 : 15.0 * 0.514444; // Convert to m/s
-    synData.targetSpeed = std::min(targetSpeed, maxTaxiSpeed);
+    double maxTaxiSpeed = perfData ? perfData->taxiSpeedKts * 0.514444 : 8.0 * 0.514444; // More realistic 8 kts default
+    
+    double targetSpeed = maxTaxiSpeed;
+    
+    // Slow down significantly when turning (realistic behavior)
+    if (std::abs(headingDiff) > 5.0) {
+        targetSpeed *= 0.3; // Much slower when turning
+    }
+    
+    // Slow down when approaching waypoints (more gradual)
+    if (distanceToWaypoint < 30.0) {
+        double speedFactor = distanceToWaypoint / 30.0;
+        targetSpeed *= std::max(0.2, speedFactor); // Minimum 20% speed when close
+    }
+    
+    // Further reduce speed for collision avoidance
+    if (synData.groundCollisionAvoidance) {
+        targetSpeed *= 0.4; // More significant reduction for safety
+    }
+    
+    // Apply acceleration/deceleration limits for realistic movement
+    double currentSpeed = synData.targetSpeed;
+    double speedDiff = targetSpeed - currentSpeed;
+    double maxAcceleration = 2.0 * deltaTime; // 2 m/s² acceleration limit
+    
+    if (std::abs(speedDiff) > maxAcceleration) {
+        speedDiff = (speedDiff > 0) ? maxAcceleration : -maxAcceleration;
+    }
+    
+    synData.targetSpeed = std::max(0.0, currentSpeed + speedDiff);
 }
 
 // Enhanced TCAS functions for predictive conflict detection and resolution

@@ -97,6 +97,15 @@ struct AircraftPerformance {
           maxAltFt(maxAlt), approachSpeedKts(approach), taxiSpeedKts(taxi) {}
 };
 
+/// Approach waypoint structure for realistic approach procedures
+struct ApproachWaypoint {
+    positionTy position;        ///< Waypoint position
+    std::string name;           ///< Waypoint name/description
+    
+    ApproachWaypoint(const positionTy& pos, const std::string& n) 
+        : position(pos), name(n) {}
+};
+
 //
 // MARK: SyntheticConnection
 //

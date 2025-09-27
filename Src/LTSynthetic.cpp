@@ -2605,6 +2605,33 @@ void SyntheticConnection::UpdateAircraftPosition(SynDataTy& synData, double curr
     }
     
     if (shouldMove && synData.targetSpeed > 0.0) {
+        // Smooth heading changes toward target heading (from our improved navigation)
+        if (synData.state != SYN_STATE_TAXI_OUT && synData.state != SYN_STATE_TAXI_IN) {
+            // For airborne states, smoothly adjust heading toward target
+            double currentHeading = synData.pos.heading();
+            double targetHeading = synData.targetHeading;
+            double headingDiff = targetHeading - currentHeading;
+            
+            // Normalize heading difference  
+            while (headingDiff > 180.0) headingDiff -= 360.0;
+            while (headingDiff < -180.0) headingDiff += 360.0;
+            
+            // Apply realistic turn rate based on aircraft state and type
+            double maxTurnRate = GetRealisticTurnRate(synData) * deltaTime; // degrees per update
+            
+            if (std::abs(headingDiff) > maxTurnRate) {
+                headingDiff = (headingDiff > 0) ? maxTurnRate : -maxTurnRate;
+            }
+            
+            // Update aircraft heading
+            synData.pos.heading() = currentHeading + headingDiff;
+            
+            // Normalize heading to 0-360 range
+            if (synData.pos.heading() < 0.0) synData.pos.heading() += 360.0;
+            if (synData.pos.heading() >= 360.0) synData.pos.heading() -= 360.0;
+        }
+        // Note: Taxi movement heading is handled in UpdateTaxiMovement()
+        
         // Calculate distance traveled in this time interval
         double distanceM = synData.targetSpeed * deltaTime; // speed is in m/s
         
